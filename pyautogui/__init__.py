@@ -541,7 +541,11 @@ elif sys.platform == "darwin":
 elif sys.platform == "win32":
     from . import _pyautogui_win as platformModule
 elif platform.system() == "Linux":
-    from . import _pyautogui_x11 as platformModule
+    # Check for Wayland session
+    if os.environ.get('WAYLAND_DISPLAY'):
+        from . import _pyautogui_wayland as platformModule
+    else:
+        from . import _pyautogui_x11 as platformModule
 else:
     raise NotImplementedError("Your platform (%s) is not supported by PyAutoGUI." % (platform.system()))
 
