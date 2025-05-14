@@ -1,207 +1,395 @@
-"""
-PyAutoGUI implementation using snegg (libei Python wrapper) for Linux Wayland environments.
+# pyautogui_snegg.py - PyAutoGUI implementation using snegg (Python wrapper for libei)
 
-The snegg library provides Python bindings for libei, a library that enables
-emulated input on modern Linux systems, particularly Wayland compositors.
-This module provides PyAutoGUI compatibility for Wayland using the libei protocol.
-
-Requires:
-- snegg (Python bindings for libei): pip install git+http://gitlab.freedesktop.org/whot/snegg
-- libei/libeis/liboeffis installed on the system
-"""
-
-import os
+import pyautogui
 import sys
-import time
+import os
 import subprocess
 from pyautogui import LEFT, MIDDLE, RIGHT
+from pathlib import Path
 
-# Import snegg for libei functionality
-try:
-    import snegg.ei
-    import snegg.oeffis
-    SNEGG_AVAILABLE = True
-except ImportError:
-    SNEGG_AVAILABLE = False
-    print("Warning: snegg module not available. Install via: pip install git+http://gitlab.freedesktop.org/whot/snegg")
+# Import snegg module for libei
+import snegg.ei
 
-# Check if we're on Linux
-if sys.platform not in ('linux', 'linux2'):
-    raise Exception('The pyautogui_wayland module should only be loaded on a Linux system with Wayland.')
-
-# Map PyAutoGUI button names to libei button codes
 BUTTON_NAME_MAPPING = {LEFT: 1, MIDDLE: 2, RIGHT: 3, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7}
 
-# Global variables for fallback mode
-_using_fallback = False
-_last_known_position = (0, 0)
-_screen_size = (1920, 1080)
+if sys.platform in ('java', 'darwin', 'win32'):
+    raise Exception('The pyautogui_snegg module should only be loaded on a Unix system that supports libei.')
 
-def initialize_libei():
-    """Initialize libei context and devices with better error handling."""
-    global _using_fallback
-    
-    if not SNEGG_AVAILABLE:
-        _using_fallback = True
-        print("Using fallback mode: snegg not available")
-        return None, None, None
-        
-    try:
-        # Try to connect via XDG_RUNTIME_DIR socket if it exists
-        xdg_runtime = os.environ.get('XDG_RUNTIME_DIR')
-        if xdg_runtime:
-            socket_path = os.path.join(xdg_runtime, 'ei-socket')
-            if os.path.exists(socket_path):
-                ctx = snegg.ei.Sender.create_for_socket("pyautogui", socket_path)
-            else:
-                # Try with default socket
-                ctx = snegg.ei.Sender()
-        else:
-            # Default creation
-            ctx = snegg.ei.Sender()
-            
-        # Configure the connection
-        ctx.connect()
-        
-        # Create a default seat
-        seat = ctx.get_seat("default")
-        
-        # Create devices with different capabilities
-        pointer = seat.create_pointer()
-        keyboard = seat.create_keyboard()
-        
-        return ctx, pointer, keyboard
-    
-    except Exception as e:
-        _using_fallback = True
-        print(f"Error initializing libei: {str(e)}")
-        print("Using fallback mode with limited functionality")
-        return None, None, None
+# Initialize snegg sender client
+_client = None
+_pointer = None
+_keyboard = None
+_emulating = False
 
-# Global objects for libei
-_libei_ctx, _libei_pointer, _libei_keyboard = None, None, None
-
-# Try to initialize, but don't crash if it fails
-try:
-    _libei_ctx, _libei_pointer, _libei_keyboard = initialize_libei()
-except Exception as e:
-    print(f"Failed to initialize libei: {str(e)}")
-    _using_fallback = True
-
-# Get display dimensions
-def _get_display_dimensions():
-    """Get the current display dimensions."""
-    global _screen_size
-    
-    try:
-        # Try using wlr-randr or similar tool to get display info
-        result = subprocess.run(['wlr-randr'], capture_output=True, text=True)
-        if result.returncode == 0:
-            # Parse output to get dimensions - simplified example
-            output = result.stdout
-            # Just a basic parsing example - this would need to be more robust
-            if 'current' in output and 'x' in output:
-                for line in output.split('\n'):
-                    if 'current' in line:
-                        parts = line.split()
-                        for part in parts:
-                            if 'x' in part:
-                                width, height = map(int, part.split('x'))
-                                _screen_size = (width, height)
-                                return width, height
-    except:
-        pass
+def _ensure_connected():
+    """Ensures that we have an active connection to the libei server."""
+    global _client, _pointer, _keyboard
+    if _client is None:
+        # Initialize snegg client connection for input sending
+        # Using socket connection with default path (uses LIBEI_SOCKET env var)
+        _client = snegg.ei.Sender.create_for_socket(None, "PyAutoGUI")
         
-    # Fallback to getting size from environment variables
-    try:
-        from screeninfo import get_monitors
-        monitors = get_monitors()
-        if monitors:
-            main_monitor = monitors[0]
-            _screen_size = (main_monitor.width, main_monitor.height)
-            return main_monitor.width, main_monitor.height
-    except:
-        # Return default fallback values
-        pass
-    
-    return _screen_size
+        # Connect to the server and wait for events
+        _client.dispatch()
+        
+        # Create devices
+        # First, we need to bind to a seat to get devices
+        for event in _client.events:
+            if event.event_type == snegg.ei.EventType.SEAT_ADDED:
+                seat = event.seat
+                # Bind to pointer and keyboard capabilities
+                capabilities = (
+                    snegg.ei.DeviceCapability.POINTER,
+                    snegg.ei.DeviceCapability.POINTER_ABSOLUTE,
+                    snegg.ei.DeviceCapability.BUTTON,
+                    snegg.ei.DeviceCapability.KEYBOARD,
+                    snegg.ei.DeviceCapability.SCROLL
+                )
+                seat.bind(capabilities)
+                break
+        
+        # Wait for device creation events
+        _client.dispatch()
+        for event in _client.events:
+            if event.event_type == snegg.ei.EventType.DEVICE_ADDED:
+                device = event.device
+                if snegg.ei.DeviceCapability.POINTER in device.capabilities:
+                    _pointer = device
+                if snegg.ei.DeviceCapability.KEYBOARD in device.capabilities:
+                    _keyboard = device
+
+def _start_emulating():
+    """Start emulating if not already emulating."""
+    global _emulating
+    if not _emulating:
+        if _pointer:
+            _pointer.start_emulating()
+        if _keyboard:
+            _keyboard.start_emulating()
+        _emulating = True
+
+def _stop_emulating():
+    """Stop emulating."""
+    global _emulating
+    if _emulating:
+        if _pointer:
+            _pointer.stop_emulating()
+        if _keyboard:
+            _keyboard.stop_emulating()
+        _emulating = False
 
 def _position():
     """Returns the current xy coordinates of the mouse cursor as a two-integer tuple."""
-    global _last_known_position
-    
-    if not _using_fallback:
-        # In real implementation we would try to get actual cursor position
-        # but libei doesn't provide direct cursor position tracking
-        pass
-        
-    return _last_known_position
+    # snegg/libei doesn't provide position query, use external tool
+    import subprocess
+    try:
+        output = subprocess.check_output(['xdotool', 'getmouselocation'])
+        parts = output.decode().strip().split()
+        x = int(parts[0].split(':')[1])
+        y = int(parts[1].split(':')[1])
+        return x, y
+    except (subprocess.SubprocessError, IndexError, ValueError):
+        return 0, 0
 
 def _size():
-    """Returns the current screen resolution."""
-    return _get_display_dimensions()
+    """Returns the width and height of the screen."""
+    # Using external tools for screen size
+    import subprocess
+    try:
+        output = subprocess.check_output(['xrandr', '--current'])
+        for line in output.decode().split('\n'):
+            if ' connected' in line and 'primary' in line:
+                parts = line.split()
+                for part in parts:
+                    if 'x' in part and part[0].isdigit():
+                        width, height = map(int, part.split('x')[0].split('+')[0].split('x'))
+                        return width, height
+    except (subprocess.SubprocessError, IndexError, ValueError):
+        pass
+    
+    # Default fallback
+    return 1920, 1080
 
-# Function implementations with fallback mode support
-def _moveTo(x, y):
-    """Move the mouse to the specified position."""
-    global _last_known_position
+def _vscroll(clicks, x=None, y=None):
+    """Performs vertical scrolling."""
+    clicks = int(clicks)
+    if clicks == 0:
+        return
     
-    # Ensure coordinates are within screen bounds
-    screen_width, screen_height = _size()
-    x = max(0, min(x, screen_width - 1))
-    y = max(0, min(y, screen_height - 1))
+    _ensure_connected()
+    _start_emulating()
     
-    if not _using_fallback and _libei_pointer:
-        try:
-            # Convert to normalized coordinates for libei (0.0 to 1.0)
-            norm_x = x / screen_width
-            norm_y = y / screen_height
-            
-            # Move the pointer using libei
-            _libei_pointer.motion_absolute(norm_x, norm_y)
-            _libei_ctx.flush()
-        except Exception as e:
-            print(f"Move error: {str(e)}")
+    if x is None or y is None:
+        x, y = _position()
     
-    # Update the last known position
-    _last_known_position = (x, y)
+    # Move to position first
+    _pointer.pointer_motion_absolute(x, y)
+    
+    # Scroll in the appropriate direction
+    # Note: For scroll wheel, negative is up, positive is down (opposite of X11 button numbers)
+    direction = -1 if clicks > 0 else 1
+    
+    for _ in range(abs(clicks)):
+        # Use scroll delta for continuous scrolling
+        _pointer.scroll_delta(0, direction)
+        # Also send discrete scroll events for compatibility
+        _pointer.scroll_discrete(0, direction)
+        _pointer.frame()
+    
+    # Send scroll stop event
+    _pointer.scroll_stop(False, True)
+    _pointer.frame()
 
-# Similar pattern for the other functions
-def _mouseDown(x, y, button):
-    """Press the mouse button at the specified position."""
-    _moveTo(x, y)
+def _hscroll(clicks, x=None, y=None):
+    """Performs horizontal scrolling."""
+    clicks = int(clicks)
+    if clicks == 0:
+        return
     
-    assert button in BUTTON_NAME_MAPPING.keys(), "button argument not in ('left', 'middle', 'right', 4, 5, 6, 7)"
-    button_code = BUTTON_NAME_MAPPING[button]
+    _ensure_connected()
+    _start_emulating()
     
-    if not _using_fallback and _libei_pointer:
-        try:
-            # Press the button using libei
-            _libei_pointer.button_press(button_code)
-            _libei_ctx.flush()
-        except Exception as e:
-            print(f"Mouse down error: {str(e)}")
+    if x is None or y is None:
+        x, y = _position()
+    
+    # Move to position first
+    _pointer.pointer_motion_absolute(x, y)
+    
+    # Scroll in the appropriate direction
+    direction = 1 if clicks > 0 else -1
+    
+    for _ in range(abs(clicks)):
+        # Use scroll delta for continuous scrolling
+        _pointer.scroll_delta(direction, 0)
+        # Also send discrete scroll events for compatibility
+        _pointer.scroll_discrete(direction, 0)
+        _pointer.frame()
+    
+    # Send scroll stop event
+    _pointer.scroll_stop(True, False)
+    _pointer.frame()
 
-def _mouseUp(x, y, button):
-    """Release the mouse button at the specified position."""
-    _moveTo(x, y)
-    
-    assert button in BUTTON_NAME_MAPPING.keys(), "button argument not in ('left', 'middle', 'right', 4, 5, 6, 7)"
-    button_code = BUTTON_NAME_MAPPING[button]
-    
-    if not _using_fallback and _libei_pointer:
-        try:
-            # Release the button using libei
-            _libei_pointer.button_release(button_code)
-            _libei_ctx.flush()
-        except Exception as e:
-            print(f"Mouse up error: {str(e)}")
+def _scroll(clicks, x=None, y=None):
+    """Default scroll function is vertical scrolling."""
+    return _vscroll(clicks, x, y)
 
 def _click(x, y, button):
-    """Click at the specified position."""
+    """Performs a mouse click (down and up)."""
     assert button in BUTTON_NAME_MAPPING.keys(), "button argument not in ('left', 'middle', 'right', 4, 5, 6, 7)"
+    button = BUTTON_NAME_MAPPING[button]
     
     _mouseDown(x, y, button)
     _mouseUp(x, y, button)
 
-# Implement the other required functions with similar pattern...
+_mouse_is_swapped_setting = None
+
+def _mouse_is_swapped():
+    """Detects if mouse buttons are swapped in the system."""
+    global _mouse_is_swapped_setting
+    if _mouse_is_swapped_setting is None:
+        try:
+            proc = subprocess.Popen(['dconf', 'read', '/org/gnome/desktop/peripherals/mouse/left-handed'], stdout=subprocess.PIPE)
+            stdout_bytes, stderr_bytes = proc.communicate()
+            _mouse_is_swapped_setting = stdout_bytes.decode('utf-8') == 'true\n'
+        except FileNotFoundError:
+            # Non-Gnome environment, assume not swapped
+            _mouse_is_swapped_setting = False
+    return _mouse_is_swapped_setting
+
+def _moveTo(x, y):
+    """Moves the mouse pointer to the specified coordinates."""
+    _ensure_connected()
+    _start_emulating()
+    
+    # Use absolute motion to move to the exact coordinates
+    _pointer.pointer_motion_absolute(x, y)
+    # Frame event to mark the end of the sequence
+    _pointer.frame()
+
+def _mouseDown(x, y, button):
+    """Presses a mouse button at the specified coordinates."""
+    _ensure_connected()
+    _start_emulating()
+    
+    # Move to position first
+    _pointer.pointer_motion_absolute(x, y)
+    # Send button press event
+    _pointer.button_button(button, True)  # True for press
+    _pointer.frame()
+
+def _mouseUp(x, y, button):
+    """Releases a mouse button at the specified coordinates."""
+    _ensure_connected()
+    
+    # Move to position first (in case the position changed since mouseDown)
+    _pointer.pointer_motion_absolute(x, y)
+    # Send button release event
+    _pointer.button_button(button, False)  # False for release
+    _pointer.frame()
+
+# Map from PyAutoGUI key names to linux/input-event-codes.h key codes
+# This is based on linux/input-event-codes.h and matches the X11 version
+def _build_keyboard_mapping():
+    # Start with all keys set to None
+    mapping = dict([(key, None) for key in pyautogui.KEY_NAMES])
+    
+    # Map alphanumeric keys using their respective input event codes
+    for i, c in enumerate("abcdefghijklmnopqrstuvwxyz"):
+        mapping[c] = 30 + i  # KEY_A is 30, KEY_B is 31, etc.
+        mapping[c.upper()] = 30 + i  # Use same code for uppercase
+
+    # Map numeric keys
+    for i, c in enumerate("1234567890"):
+        mapping[c] = 2 + i  # KEY_1 is 2, KEY_2 is 3, etc.
+    
+    # Map special keys
+    special_keys = {
+        'backspace': 14,      # KEY_BACKSPACE
+        '\b': 14,             # KEY_BACKSPACE
+        'tab': 15,            # KEY_TAB
+        '\t': 15,             # KEY_TAB
+        'enter': 28,          # KEY_ENTER
+        'return': 28,         # KEY_ENTER
+        '\n': 28,             # KEY_ENTER
+        '\r': 28,             # KEY_ENTER
+        'shift': 42,          # KEY_LEFTSHIFT
+        'shiftleft': 42,      # KEY_LEFTSHIFT
+        'shiftright': 54,     # KEY_RIGHTSHIFT
+        'ctrl': 29,           # KEY_LEFTCTRL
+        'ctrlleft': 29,       # KEY_LEFTCTRL
+        'ctrlright': 97,      # KEY_RIGHTCTRL
+        'alt': 56,            # KEY_LEFTALT
+        'altleft': 56,        # KEY_LEFTALT
+        'altright': 100,      # KEY_RIGHTALT
+        'pause': 119,         # KEY_PAUSE
+        'capslock': 58,       # KEY_CAPSLOCK
+        'esc': 1,             # KEY_ESC
+        'escape': 1,          # KEY_ESC
+        '\e': 1,              # KEY_ESC
+        'space': 57,          # KEY_SPACE
+        ' ': 57,              # KEY_SPACE
+        'pageup': 104,        # KEY_PAGEUP
+        'pgup': 104,          # KEY_PAGEUP
+        'pagedown': 109,      # KEY_PAGEDOWN
+        'pgdn': 109,          # KEY_PAGEDOWN
+        'end': 107,           # KEY_END
+        'home': 102,          # KEY_HOME
+        'left': 105,          # KEY_LEFT
+        'up': 103,            # KEY_UP
+        'right': 106,         # KEY_RIGHT
+        'down': 108,          # KEY_DOWN
+        'insert': 110,        # KEY_INSERT
+        'delete': 111,        # KEY_DELETE
+        'del': 111,           # KEY_DELETE
+        'numlock': 69,        # KEY_NUMLOCK
+        'scrolllock': 70,     # KEY_SCROLLLOCK
+        'win': 125,           # KEY_LEFTMETA
+        'winleft': 125,       # KEY_LEFTMETA
+        'winright': 126,      # KEY_RIGHTMETA
+        'apps': 127,          # KEY_COMPOSE
+    }
+    
+    # Add function keys
+    for i in range(1, 25):
+        special_keys[f'f{i}'] = 58 + i  # F1 is KEY_F1 (59), F2 is KEY_F2 (60), etc.
+    
+    # Add numpad keys
+    for i in range(10):
+        special_keys[f'num{i}'] = 96 + i if i > 0 else 82  # KEY_KP1 is 79, etc. but KEY_KP0 is 82
+    
+    special_keys.update({
+        'multiply': 55,    # KEY_KPASTERISK
+        'add': 78,         # KEY_KPPLUS
+        'separator': 83,   # KEY_KPCOMMA
+        'subtract': 74,    # KEY_KPMINUS
+        'decimal': 83,     # KEY_KPDOT
+        'divide': 98,      # KEY_KPSLASH
+    })
+    
+    # Add special characters
+    char_mapping = {
+        '!': 2,            # KEY_1 + SHIFT
+        '@': 3,            # KEY_2 + SHIFT
+        '#': 4,            # KEY_3 + SHIFT
+        '$': 5,            # KEY_4 + SHIFT
+        '%': 6,            # KEY_5 + SHIFT
+        '^': 7,            # KEY_6 + SHIFT
+        '&': 8,            # KEY_7 + SHIFT
+        '*': 9,            # KEY_8 + SHIFT
+        '(': 10,           # KEY_9 + SHIFT
+        ')': 11,           # KEY_0 + SHIFT
+        '-': 12,           # KEY_MINUS
+        '_': 12,           # KEY_MINUS + SHIFT
+        '=': 13,           # KEY_EQUAL
+        '+': 13,           # KEY_EQUAL + SHIFT
+        '[': 26,           # KEY_LEFTBRACE
+        '{': 26,           # KEY_LEFTBRACE + SHIFT
+        ']': 27,           # KEY_RIGHTBRACE
+        '}': 27,           # KEY_RIGHTBRACE + SHIFT
+        '\\': 43,          # KEY_BACKSLASH
+        '|': 43,           # KEY_BACKSLASH + SHIFT
+        ';': 39,           # KEY_SEMICOLON
+        ':': 39,           # KEY_SEMICOLON + SHIFT
+        "'": 40,           # KEY_APOSTROPHE
+        '"': 40,           # KEY_APOSTROPHE + SHIFT
+        '`': 41,           # KEY_GRAVE
+        '~': 41,           # KEY_GRAVE + SHIFT
+        ',': 51,           # KEY_COMMA
+        '<': 51,           # KEY_COMMA + SHIFT
+        '.': 52,           # KEY_DOT
+        '>': 52,           # KEY_DOT + SHIFT
+        '/': 53,           # KEY_SLASH
+        '?': 53,           # KEY_SLASH + SHIFT
+    }
+    
+    mapping.update(special_keys)
+    mapping.update(char_mapping)
+    
+    return mapping
+
+keyboardMapping = _build_keyboard_mapping()
+
+def _keyDown(key):
+    """Performs a keyboard key press without the release."""
+    if key not in keyboardMapping or keyboardMapping[key] is None:
+        return
+
+    _ensure_connected()
+    _start_emulating()
+    
+    # Handle direct keycodes
+    if isinstance(key, int):
+        _keyboard.keyboard_key(key, True)  # True for press
+        _keyboard.frame()
+        return
+
+    # Handle shift for uppercase letters and special characters
+    needsShift = pyautogui.isShiftCharacter(key)
+    if needsShift:
+        _keyboard.keyboard_key(42, True)  # 42 is KEY_LEFTSHIFT
+        _keyboard.frame()
+    
+    _keyboard.keyboard_key(keyboardMapping[key], True)  # True for press
+    _keyboard.frame()
+
+def _keyUp(key):
+    """Performs a keyboard key release."""
+    if key not in keyboardMapping or keyboardMapping[key] is None:
+        return
+
+    _ensure_connected()
+    
+    # Handle direct keycodes
+    if isinstance(key, int):
+        _keyboard.keyboard_key(key, False)  # False for release
+        _keyboard.frame()
+        return
+
+    _keyboard.keyboard_key(keyboardMapping[key], False)  # False for release
+    _keyboard.frame()
+    
+    # Handle shift for uppercase letters and special characters
+    needsShift = pyautogui.isShiftCharacter(key)
+    if needsShift:
+        _keyboard.keyboard_key(42, False)  # 42 is KEY_LEFTSHIFT
+        _keyboard.frame()
